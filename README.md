@@ -1,6 +1,6 @@
 # GO Event Store
 
-![Test Workflow](https://github.com/fjogeleit/go-event-store/workflows/Workflow/badge.svg)
+![Test Workflow](https://github.com/go-event-store/eventstore/workflows/Workflow/badge.svg)
 
 This Library is an EventStore heavily inspired by the prooph/event-store v7.0.
 
