@@ -1,6 +1,6 @@
 # GO Event Store
 
-![Test Workflow](https://github.com/fjogeleit/go-event-store/workflows/Workflow/badge.svg)
+![Test Workflow](https://github.com/go-event-store/eventstore/workflows/Workflow/badge.svg)
 
 This Library is an EventStore heavily inspired by the prooph/event-store v7.0.
 
@@ -27,7 +27,7 @@ This Library is an EventStore heavily inspired by the prooph/event-store v7.0.
 
 ## Examples
 
-See the [GO EventStore Example](https://github.com/fjogeleit/go-event-store-example) Repository for a basic integration in the Gin Framework
+See the [GO EventStore Example](https://github.com/go-event-store/eventstore-example) Repository for a basic integration in the Gin Framework
 
 ### Initialize the EventStore
 

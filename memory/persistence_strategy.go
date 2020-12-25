@@ -6,7 +6,7 @@ import (
 	"sort"
 	"time"
 
-	eventstore "github.com/fjogeleit/go-event-store"
+	eventstore "github.com/go-event-store/eventstore"
 )
 
 type PersistenceStrategy struct {

@@ -3,7 +3,7 @@ package eventstore_test
 import (
 	"testing"
 
-	eventstore "github.com/fjogeleit/go-event-store"
+	eventstore "github.com/go-event-store/eventstore"
 )
 
 type FooEvent struct {

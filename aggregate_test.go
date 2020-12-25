@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	eventstore "github.com/fjogeleit/go-event-store"
-	"github.com/fjogeleit/go-event-store/memory"
+	eventstore "github.com/go-event-store/eventstore"
+	"github.com/go-event-store/eventstore/memory"
 )
 
 type BazWasCreated struct {

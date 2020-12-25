@@ -1,6 +1,6 @@
 package example
 
-import eventstore "github.com/fjogeleit/go-event-store"
+import eventstore "github.com/go-event-store/eventstore"
 
 type FooEvent struct {
 	Foo string

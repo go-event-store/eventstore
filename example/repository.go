@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	eventstore "github.com/fjogeleit/go-event-store"
+	eventstore "github.com/go-event-store/eventstore"
 	uuid "github.com/satori/go.uuid"
 )
 

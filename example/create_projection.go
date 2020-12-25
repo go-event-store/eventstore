@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	eventstore "github.com/fjogeleit/go-event-store"
-	"github.com/fjogeleit/go-event-store/memory"
+	eventstore "github.com/go-event-store/eventstore"
+	"github.com/go-event-store/eventstore/memory"
 )
 
 func CreateProjection(ctx context.Context) {

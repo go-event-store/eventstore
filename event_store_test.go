@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	eventstore "github.com/fjogeleit/go-event-store"
-	"github.com/fjogeleit/go-event-store/memory"
+	eventstore "github.com/go-event-store/eventstore"
+	"github.com/go-event-store/eventstore/memory"
 	uuid "github.com/satori/go.uuid"
 )
 

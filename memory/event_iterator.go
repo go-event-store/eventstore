@@ -3,7 +3,7 @@ package memory
 import (
 	"context"
 
-	eventstore "github.com/fjogeleit/go-event-store"
+	eventstore "github.com/go-event-store/eventstore"
 )
 
 type DomainEventIterator struct {
