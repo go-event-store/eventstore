@@ -23,8 +23,8 @@ func CreateProjection(ctx context.Context) {
 		Init(func() interface{} {
 			return []string{}
 		}).
-		When(map[string]func(state interface{}, event eventstore.DomainEvent) interface{}{
-			FooEventName: func(state interface{}, event eventstore.DomainEvent) interface{} {
+		When(map[string]eventstore.EventHandler{
+			FooEventName: func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
 				foo := event.Payload().(FooEvent).Foo
 				nextState := []string{}
 
@@ -37,9 +37,9 @@ func CreateProjection(ctx context.Context) {
 					nextState = s
 				}
 
-				return append(nextState, foo)
+				return append(nextState, foo), nil
 			},
-			BarEventName: func(state interface{}, event eventstore.DomainEvent) interface{} {
+			BarEventName: func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
 				bar := event.Payload().(BarEvent).Bar
 				nextState := []string{}
 
@@ -52,7 +52,7 @@ func CreateProjection(ctx context.Context) {
 					nextState = s
 				}
 
-				return append(nextState, bar)
+				return append(nextState, bar), nil
 			},
 		}).
 		Run(ctx, false)

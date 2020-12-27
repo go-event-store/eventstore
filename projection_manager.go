@@ -25,7 +25,7 @@ type StreamProjection struct {
 // EventHandler process a single Event and returns the new ProjectionState
 // The First argument is the current state of the projection
 // The Second argument is the loaded event
-type EventHandler = func(state interface{}, event DomainEvent) interface{}
+type EventHandler = func(state interface{}, event DomainEvent) (interface{}, error)
 
 // ProjectionManager manages the Projections Table / Collection and hase multiple implementations for different persistens layers
 type ProjectionManager interface {

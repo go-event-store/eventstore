@@ -11,11 +11,12 @@ type Query struct {
 	Status           Status
 	eventStore       *EventStore
 	initHandler      func() interface{}
-	handler          func(state interface{}, event DomainEvent) interface{}
-	handlers         map[string]func(state interface{}, event DomainEvent) interface{}
+	handler          EventHandler
+	handlers         map[string]EventHandler
 	metadataMatchers map[string]MetadataMatcher
 	streamPositions  map[string]int
 	isStopped        bool
+	err              error
 
 	query struct {
 		all     bool
@@ -26,7 +27,7 @@ type Query struct {
 // Init the state, define the type and/or prefill it with data
 func (q *Query) Init(handler func() interface{}) *Query {
 	if q.initHandler != nil {
-		panic(ProjectorAlreadyInitialized())
+		q.err = ProjectorAlreadyInitialized{}
 	}
 
 	q.initHandler = handler
@@ -38,7 +39,7 @@ func (q *Query) Init(handler func() interface{}) *Query {
 // FromAll read events from all existing EventStreams
 func (q *Query) FromAll() *Query {
 	if q.query.all || len(q.query.streams) > 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorFromWasAlreadyCalled{}
 	}
 
 	q.query.all = true
@@ -49,7 +50,7 @@ func (q *Query) FromAll() *Query {
 // FromStream read events from a single EventStream
 func (q *Query) FromStream(streamName string, matcher MetadataMatcher) *Query {
 	if q.query.all || len(q.query.streams) > 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorFromWasAlreadyCalled{}
 	}
 
 	q.query.streams = append(q.query.streams, streamName)
@@ -61,7 +62,7 @@ func (q *Query) FromStream(streamName string, matcher MetadataMatcher) *Query {
 // FromStreams read events from multiple EventStreams
 func (q *Query) FromStreams(streams ...StreamProjection) *Query {
 	if q.query.all || len(q.query.streams) > 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorFromWasAlreadyCalled{}
 	}
 
 	for _, stream := range streams {
@@ -75,9 +76,9 @@ func (q *Query) FromStreams(streams ...StreamProjection) *Query {
 // When define multiple handlers for
 // You can create one handler for one event
 // Events without a handler will not be progressed
-func (q *Query) When(handlers map[string]func(state interface{}, event DomainEvent) interface{}) *Query {
+func (q *Query) When(handlers map[string]EventHandler) *Query {
 	if q.handler != nil || len(q.handlers) != 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorHandlerAlreadyDefined{}
 	}
 
 	q.handlers = handlers
@@ -86,9 +87,9 @@ func (q *Query) When(handlers map[string]func(state interface{}, event DomainEve
 }
 
 // WhenAny defines a single handler for all possible Events
-func (q *Query) WhenAny(handler func(state interface{}, event DomainEvent) interface{}) *Query {
+func (q *Query) WhenAny(handler EventHandler) *Query {
 	if q.handler != nil || len(q.handlers) != 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorHandlerAlreadyDefined{}
 	}
 
 	q.handler = handler
@@ -100,6 +101,7 @@ func (q *Query) WhenAny(handler func(state interface{}, event DomainEvent) inter
 func (q *Query) Reset() {
 	q.streamPositions = map[string]int{}
 	q.state = struct{}{}
+	q.err = nil
 
 	if q.initHandler != nil {
 		q.state = q.initHandler()
@@ -114,12 +116,16 @@ func (q *Query) Stop() {
 
 // Run the Query
 func (q *Query) Run(ctx context.Context) error {
+	if q.err != nil {
+		return q.err
+	}
+
 	if q.handler == nil && len(q.handlers) == 0 {
-		panic(ProjectorNoHandler())
+		return ProjectorHasNoHandler{}
 	}
 
 	if q.state == nil {
-		panic(ProjectorStateNotInitialised())
+		return ProjectorStateNotInitialised{}
 	}
 
 	q.isStopped = false
@@ -135,9 +141,9 @@ func (q *Query) Run(ctx context.Context) error {
 		return err
 	}
 
-	q.state = q.handleEvents(q.state, events)
+	q.state, err = q.handleEvents(q.state, events)
 
-	return nil
+	return err
 }
 
 // State returns the current query State
@@ -177,27 +183,30 @@ func (q *Query) retreiveEventsFromStream(ctx context.Context) (DomainEventIterat
 	return q.eventStore.MergeAndLoad(ctx, 0, streams...)
 }
 
-func (q *Query) handleEvents(state interface{}, events DomainEventIterator) interface{} {
+func (q *Query) handleEvents(state interface{}, events DomainEventIterator) (interface{}, error) {
+	var err error
 	for events.Next() {
 		event, err := events.Current()
 		if err != nil {
-			return err
+			return state, err
 		}
 
 		if q.handler != nil {
-			state = q.handler(state, *event)
+			state, err = q.handler(state, *event)
 		}
-
 		if handler, ok := q.handlers[event.Name()]; ok {
-			state = handler(state, *event)
+			state, err = handler(state, *event)
+		}
+		if err != nil {
+			return state, err
 		}
 
 		if q.isStopped {
-			return state
+			return state, err
 		}
 	}
 
-	return state
+	return state, err
 }
 
 // NewQuery for the given EventStore
@@ -208,7 +217,7 @@ func NewQuery(eventStore *EventStore) Query {
 		eventStore:       eventStore,
 		initHandler:      nil,
 		handler:          nil,
-		handlers:         map[string]func(state interface{}, event DomainEvent) interface{}{},
+		handlers:         map[string]EventHandler{},
 		metadataMatchers: map[string]MetadataMatcher{},
 		streamPositions:  map[string]int{},
 		isStopped:        false,

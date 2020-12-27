@@ -13,14 +13,15 @@ type Projector struct {
 	eventStore       *EventStore
 	manager          ProjectionManager
 	initHandler      func() interface{}
-	handler          func(state interface{}, event DomainEvent) interface{}
-	handlers         map[string]func(state interface{}, event DomainEvent) interface{}
+	handler          EventHandler
+	handlers         map[string]EventHandler
 	metadataMatchers map[string]MetadataMatcher
 	streamPositions  map[string]int
 	persistBlockSize int
 	eventCounter     int
 	streamCreated    bool
 	isStopped        bool
+	err              error
 
 	query struct {
 		all     bool
@@ -31,7 +32,7 @@ type Projector struct {
 // Init the state, define the type and/or prefill it with data
 func (q *Projector) Init(handler func() interface{}) *Projector {
 	if q.initHandler != nil {
-		panic(ProjectorAlreadyInitialized())
+		q.err = ProjectorAlreadyInitialized{}
 	}
 
 	q.initHandler = handler
@@ -43,7 +44,7 @@ func (q *Projector) Init(handler func() interface{}) *Projector {
 // FromAll read events from all existing EventStreams
 func (q *Projector) FromAll() *Projector {
 	if q.query.all || len(q.query.streams) > 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorFromWasAlreadyCalled{}
 	}
 
 	q.query.all = true
@@ -54,7 +55,7 @@ func (q *Projector) FromAll() *Projector {
 // FromStream read events from a single EventStream
 func (q *Projector) FromStream(streamName string, matcher MetadataMatcher) *Projector {
 	if q.query.all || len(q.query.streams) > 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorFromWasAlreadyCalled{}
 	}
 
 	q.query.streams = append(q.query.streams, streamName)
@@ -66,7 +67,7 @@ func (q *Projector) FromStream(streamName string, matcher MetadataMatcher) *Proj
 // FromStreams read events from multiple EventStreams
 func (q *Projector) FromStreams(streams ...StreamProjection) *Projector {
 	if q.query.all || len(q.query.streams) > 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorFromWasAlreadyCalled{}
 	}
 
 	for _, stream := range streams {
@@ -82,7 +83,7 @@ func (q *Projector) FromStreams(streams ...StreamProjection) *Projector {
 // Events without a handler will not be progressed
 func (q *Projector) When(handlers map[string]EventHandler) *Projector {
 	if q.handler != nil || len(q.handlers) != 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorHandlerAlreadyDefined{}
 	}
 
 	q.handlers = handlers
@@ -93,7 +94,7 @@ func (q *Projector) When(handlers map[string]EventHandler) *Projector {
 // WhenAny defines a single handler for all possible Events
 func (q *Projector) WhenAny(handler EventHandler) *Projector {
 	if q.handler != nil || len(q.handlers) != 0 {
-		panic(ProjectorFromWasAlreadyCalled())
+		q.err = ProjectorHandlerAlreadyDefined{}
 	}
 
 	q.handler = handler
@@ -172,12 +173,16 @@ func (q *Projector) Stop(ctx context.Context) error {
 
 // Run the Projection
 func (q *Projector) Run(ctx context.Context, keepRunning bool) error {
+	if q.err != nil {
+		return q.err
+	}
+
 	if q.handler == nil && len(q.handlers) == 0 {
-		panic(ProjectorNoHandler())
+		return ProjectorHasNoHandler{}
 	}
 
 	if q.state == nil {
-		panic(ProjectorStateNotInitialised())
+		return ProjectorStateNotInitialised{}
 	}
 
 	var err error
@@ -412,11 +417,14 @@ func (q *Projector) handleStream(ctx context.Context, events DomainEventIterator
 		q.eventCounter++
 
 		if q.handler != nil {
-			q.state = q.handler(q.state, *event)
+			q.state, err = q.handler(q.state, *event)
 		}
 
 		if handler, ok := q.handlers[event.Name()]; ok {
-			q.state = handler(q.state, *event)
+			q.state, err = handler(q.state, *event)
+		}
+		if err != nil {
+			return err
 		}
 
 		err = q.persistAndFetchRemoteStatusWhenBlockSizeThresholdReached(ctx)
@@ -443,7 +451,7 @@ func NewProjector(name string, eventStore *EventStore, manager ProjectionManager
 		manager:          manager,
 		initHandler:      nil,
 		handler:          nil,
-		handlers:         map[string]func(state interface{}, event DomainEvent) interface{}{},
+		handlers:         map[string]EventHandler{},
 		metadataMatchers: map[string]MetadataMatcher{},
 		streamPositions:  map[string]int{},
 		isStopped:        false,
