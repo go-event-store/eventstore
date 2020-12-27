@@ -2,6 +2,8 @@ package eventstore
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"time"
 )
 
@@ -20,8 +22,13 @@ type Projector struct {
 	persistBlockSize int
 	eventCounter     int
 	streamCreated    bool
-	isStopped        bool
+	running          bool
 	err              error
+	wg               *sync.WaitGroup
+	stateMutex       *sync.Mutex
+	positionMutex    *sync.Mutex
+
+	statusChan chan Status
 
 	query struct {
 		all     bool
@@ -125,6 +132,10 @@ func (q *Projector) LinkTo(ctx context.Context, streamName string, event DomainE
 // Delete the Projection from the Projections table / collection and if deleteEmittedEvents is true
 // Also if exists the related Emit-EventStream
 func (q *Projector) Delete(ctx context.Context, deleteEmittedEvents bool) error {
+	if q.running {
+		return errors.New("Could not be deleted while running")
+	}
+
 	err := q.manager.DeleteProjection(ctx, q.name)
 	if err != nil {
 		return err
@@ -142,11 +153,22 @@ func (q *Projector) Delete(ctx context.Context, deleteEmittedEvents bool) error 
 
 // Reset the Projection state and EventStream positions
 func (q *Projector) Reset(ctx context.Context) error {
-	q.streamPositions = map[string]int{}
+	q.stateMutex.Lock()
 	q.state = struct{}{}
+	q.stateMutex.Unlock()
+
+	q.stateMutex.Lock()
+	q.streamPositions = map[string]int{}
+	q.stateMutex.Unlock()
 
 	if q.initHandler != nil {
+		q.stateMutex.Lock()
 		q.state = q.initHandler()
+		q.stateMutex.Unlock()
+	}
+
+	if q.running {
+		q.statusChan <- StatusResetting
 	}
 
 	return q.manager.ResetProjection(ctx, q.name, q.state)
@@ -154,19 +176,14 @@ func (q *Projector) Reset(ctx context.Context) error {
 
 // Stop the Projection and persist the current state and EventStream positions
 func (q *Projector) Stop(ctx context.Context) error {
-	err := q.manager.PersistProjection(ctx, q.name, q.state, q.streamPositions)
+	err := q.manager.UpdateProjectionStatus(ctx, q.name, StatusIdle)
 	if err != nil {
 		return err
 	}
 
-	q.status = StatusIdle
-
-	err = q.manager.UpdateProjectionStatus(ctx, q.name, StatusIdle)
-	if err != nil {
-		return err
+	if q.running {
+		q.statusChan <- StatusStopping
 	}
-
-	q.isStopped = true
 
 	return nil
 }
@@ -187,39 +204,7 @@ func (q *Projector) Run(ctx context.Context, keepRunning bool) error {
 
 	var err error
 
-	switch q.fetchRemoteStatus(ctx) {
-	case StatusStopping:
-		err = q.load(ctx)
-		if err != nil {
-			return err
-		}
-
-		err = q.Stop(ctx)
-		if err != nil {
-			return err
-		}
-	case StatusDeleting:
-		err = q.Delete(ctx, false)
-		if err != nil {
-			return err
-		}
-	case StatusDeletingIinclEmittedEevents:
-		err = q.Delete(ctx, false)
-		if err != nil {
-			return err
-		}
-	case StatusResetting:
-		err = q.Reset(ctx)
-		if err != nil {
-			return err
-		}
-
-		if keepRunning {
-			q.startAgain(ctx)
-		}
-	}
-
-	if ok, err := q.manager.ProjectionExists(ctx, q.name); ok == false {
+	if ok, err := q.manager.ProjectionExists(ctx, q.name); !ok {
 		if err != nil {
 			return err
 		}
@@ -240,94 +225,126 @@ func (q *Projector) Run(ctx context.Context, keepRunning bool) error {
 		return err
 	}
 
-	q.isStopped = false
+	stopChan := make(chan bool)
+	errorChan := make(chan error)
+	eventChan := make(chan DomainEvent)
+	persistChan := make(chan int)
 
+	q.running = true
+
+	defer func() {
+		close(stopChan)
+		close(errorChan)
+	}()
+
+	q.wg.Add(3)
+
+	go q.fetchEvents(ctx, stopChan, eventChan, errorChan)
+	go q.handleEvents(persistChan, eventChan, errorChan)
+	go q.persist(ctx, persistChan, errorChan)
+
+	go func() {
+		if !keepRunning {
+			err := q.Stop(ctx)
+			if err != nil {
+				q.err = err
+			}
+		}
+	}()
+
+	select {
+	case err := <-errorChan:
+		stopChan <- true
+
+		q.wg.Wait()
+		return err
+	case status := <-q.statusChan:
+		q.status = status
+
+		stopChan <- true
+		q.running = false
+		q.wg.Wait()
+		return q.err
+	}
+}
+
+func (q *Projector) fetchEvents(ctx context.Context, stopChan <-chan bool, eventChan chan<- DomainEvent, errorChan chan<- error) {
+	ticker := time.NewTicker(200 * time.Millisecond)
 	for {
 		events, err := q.retreiveEventsFromStream(ctx)
 		if err != nil {
-			return err
+			errorChan <- err
+			return
+		}
+		for events.Next() {
+			event, err := events.Current()
+			if err != nil {
+				errorChan <- err
+				return
+			}
+
+			eventChan <- *event
 		}
 
-		err = q.handleStream(ctx, events)
-		if err != nil {
-			return err
+		select {
+		case <-ticker.C:
+		case <-stopChan:
+			close(eventChan)
+			q.wg.Done()
+			return
 		}
-
-		if q.eventCounter > 0 {
-			err = q.manager.PersistProjection(ctx, q.name, q.state, q.streamPositions)
-			if err != nil {
-				return err
-			}
-		}
-
-		q.eventCounter = 0
-
-		switch q.fetchRemoteStatus(ctx) {
-		case StatusStopping:
-			err = q.Stop(ctx)
-			if err != nil {
-				return err
-			}
-		case StatusDeleting:
-			err = q.Delete(ctx, false)
-			if err != nil {
-				return err
-			}
-		case StatusDeletingIinclEmittedEevents:
-			err = q.Delete(ctx, true)
-			if err != nil {
-				return err
-			}
-		case StatusResetting:
-			err = q.Reset(ctx)
-			if err != nil {
-				return err
-			}
-
-			if keepRunning {
-				err = q.startAgain(ctx)
-				if err != nil {
-					return err
-				}
-			}
-		}
-
-		if !keepRunning || q.isStopped {
-			break
-		}
-
-		time.Sleep(200 * time.Millisecond)
 	}
+}
 
-	return nil
+func (q *Projector) handleEvents(persistChan chan<- int, eventChan <-chan DomainEvent, errorChan chan<- error) {
+	defer func() {
+		persistChan <- 1
+		close(persistChan)
+		q.wg.Done()
+	}()
+	var counter int
+	var err error
+
+	for event := range eventChan {
+		err = q.handleStream(event)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+
+		counter++
+
+		if counter == q.persistBlockSize {
+			persistChan <- 1
+		}
+	}
+}
+
+func (q *Projector) persist(ctx context.Context, persistChan <-chan int, errorChan chan<- error) {
+	defer q.wg.Done()
+
+	for range persistChan {
+		err := q.manager.PersistProjection(ctx, q.name, q.state, q.streamPositions)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+	}
 }
 
 // State returns the current Projection State
-func (q Projector) State() interface{} {
+func (q *Projector) State() interface{} {
 	return q.state
 }
 
 // Name of the Projection
-func (q Projector) Name() string {
+func (q *Projector) Name() string {
 	return q.name
 }
 
 // Status of the Projection
-func (q Projector) Status() Status {
+func (q *Projector) Status() Status {
 	return q.status
-}
-
-func (q *Projector) startAgain(ctx context.Context) error {
-	q.isStopped = false
-
-	err := q.manager.UpdateProjectionStatus(ctx, q.name, StatusRunning)
-	if err != nil {
-		return err
-	}
-
-	q.status = StatusRunning
-
-	return nil
 }
 
 func (q *Projector) load(ctx context.Context) error {
@@ -341,26 +358,6 @@ func (q *Projector) load(ctx context.Context) error {
 	}
 
 	q.state = state
-
-	return nil
-}
-
-func (q *Projector) persistAndFetchRemoteStatusWhenBlockSizeThresholdReached(ctx context.Context) error {
-	if q.eventCounter != q.persistBlockSize {
-		return nil
-	}
-
-	err := q.manager.PersistProjection(ctx, q.name, q.state, q.streamPositions)
-	if err != nil {
-		return err
-	}
-
-	q.eventCounter = 0
-	q.status = q.fetchRemoteStatus(ctx)
-
-	if _, ok := FindStatusInSlice([]Status{StatusIdle, StatusRunning}, q.status); ok == false {
-		q.isStopped = true
-	}
 
 	return nil
 }
@@ -406,38 +403,31 @@ func (q *Projector) retreiveEventsFromStream(ctx context.Context) (DomainEventIt
 	return q.eventStore.MergeAndLoad(ctx, 0, streams...)
 }
 
-func (q *Projector) handleStream(ctx context.Context, events DomainEventIterator) error {
-	for events.Next() {
-		event, err := events.Current()
-		if err != nil {
-			return err
-		}
+func (q *Projector) handleStream(event DomainEvent) error {
+	var err error
+	var state interface{}
 
-		q.streamPositions[event.Metadata()["stream"].(string)] = event.Number()
-		q.eventCounter++
+	q.positionMutex.Lock()
+	q.streamPositions[event.Metadata()["stream"].(string)] = event.Number()
+	q.positionMutex.Unlock()
 
-		if q.handler != nil {
-			q.state, err = q.handler(q.state, *event)
-		}
+	if q.handler != nil {
+		state, err = q.handler(q.state, event)
 
-		if handler, ok := q.handlers[event.Name()]; ok {
-			q.state, err = handler(q.state, *event)
-		}
-		if err != nil {
-			return err
-		}
-
-		err = q.persistAndFetchRemoteStatusWhenBlockSizeThresholdReached(ctx)
-		if err != nil {
-			return err
-		}
-
-		if q.isStopped {
-			break
-		}
+		q.stateMutex.Lock()
+		q.state = state
+		q.stateMutex.Unlock()
 	}
 
-	return nil
+	if handler, ok := q.handlers[event.Name()]; ok {
+		state, err = handler(q.state, event)
+
+		q.stateMutex.Lock()
+		q.state = state
+		q.stateMutex.Unlock()
+	}
+
+	return err
 }
 
 // NewProjector create a new Projector to configure and run a new projection
@@ -454,9 +444,14 @@ func NewProjector(name string, eventStore *EventStore, manager ProjectionManager
 		handlers:         map[string]EventHandler{},
 		metadataMatchers: map[string]MetadataMatcher{},
 		streamPositions:  map[string]int{},
-		isStopped:        false,
+		running:          false,
 		streamCreated:    false,
 		eventCounter:     0,
 		persistBlockSize: 1000,
+		wg:               new(sync.WaitGroup),
+		stateMutex:       new(sync.Mutex),
+		positionMutex:    new(sync.Mutex),
+
+		statusChan: make(chan Status),
 	}
 }

@@ -14,7 +14,7 @@ type projection struct {
 }
 
 type ProjectionManager struct {
-	projections map[string]projection
+	projections map[string]*projection
 }
 
 func (pm ProjectionManager) FetchProjectionStatus(_ context.Context, projectionName string) (eventstore.Status, error) {
@@ -27,7 +27,7 @@ func (pm ProjectionManager) FetchProjectionStatus(_ context.Context, projectionN
 }
 
 func (pm ProjectionManager) CreateProjection(_ context.Context, projectionName string, state interface{}, status eventstore.Status) error {
-	pm.projections[projectionName] = projection{
+	pm.projections[projectionName] = &projection{
 		name:     projectionName,
 		position: map[string]int{},
 		state:    state,
@@ -44,7 +44,7 @@ func (pm ProjectionManager) DeleteProjection(_ context.Context, projectionName s
 }
 
 func (pm ProjectionManager) ResetProjection(_ context.Context, projectionName string, state interface{}) error {
-	pm.projections[projectionName] = projection{
+	pm.projections[projectionName] = &projection{
 		name:     projectionName,
 		position: map[string]int{},
 		state:    state,
@@ -93,5 +93,7 @@ func (pm ProjectionManager) ProjectionExists(_ context.Context, projectionName s
 }
 
 func NewProjectionManager() *ProjectionManager {
-	return &ProjectionManager{}
+	return &ProjectionManager{
+		projections: map[string]*projection{},
+	}
 }
