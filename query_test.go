@@ -37,12 +37,12 @@ func Test_Queries(t *testing.T) {
 			Init(func() interface{} {
 				return []string{}
 			}).
-			When(map[string]func(state interface{}, event eventstore.DomainEvent) interface{}{
-				"FooEvent": func(state interface{}, event eventstore.DomainEvent) interface{} {
-					return append(state.([]string), event.Payload().(FooEvent).Foo)
+			When(map[string]eventstore.EventHandler{
+				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
 				},
-				"BarEvent": func(state interface{}, event eventstore.DomainEvent) interface{} {
-					return append(state.([]string), event.Payload().(BarEvent).Bar)
+				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
 				},
 			})
 
@@ -182,12 +182,12 @@ func Test_Queries(t *testing.T) {
 				return []string{}
 			}).
 			FromAll().
-			When(map[string]func(state interface{}, event eventstore.DomainEvent) interface{}{
-				"FooEvent": func(state interface{}, event eventstore.DomainEvent) interface{} {
-					return append(state.([]string), event.Payload().(FooEvent).Foo)
+			When(map[string]eventstore.EventHandler{
+				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
 				},
-				"BarEvent": func(state interface{}, event eventstore.DomainEvent) interface{} {
-					return append(state.([]string), event.Payload().(BarEvent).Bar)
+				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
 				},
 			}).
 			Run(ctx)
@@ -232,7 +232,7 @@ func Test_Queries(t *testing.T) {
 				return []string{}
 			}).
 			FromStreams(eventstore.StreamProjection{StreamName: "foo-stream"}, eventstore.StreamProjection{StreamName: "bar-stream"}).
-			WhenAny(func(state interface{}, event eventstore.DomainEvent) interface{} {
+			WhenAny(func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
 				switch e := event.Payload().(type) {
 				case FooEvent:
 					state = append(state.([]string), e.Foo)
@@ -240,7 +240,7 @@ func Test_Queries(t *testing.T) {
 					query.Stop()
 				}
 
-				return state
+				return state, nil
 			}).
 			Run(ctx)
 
