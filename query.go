@@ -121,11 +121,11 @@ func (q *Query) Run(ctx context.Context) error {
 	}
 
 	if q.handler == nil && len(q.handlers) == 0 {
-		q.err = ProjectorHasNoHandler{}
+		return ProjectorHasNoHandler{}
 	}
 
 	if q.state == nil {
-		q.err = ProjectorStateNotInitialised{}
+		return ProjectorStateNotInitialised{}
 	}
 
 	q.isStopped = false
@@ -141,9 +141,9 @@ func (q *Query) Run(ctx context.Context) error {
 		return err
 	}
 
-	q.state, q.err = q.handleEvents(q.state, events)
+	q.state, err = q.handleEvents(q.state, events)
 
-	return q.err
+	return err
 }
 
 // State returns the current query State
@@ -194,9 +194,11 @@ func (q *Query) handleEvents(state interface{}, events DomainEventIterator) (int
 		if q.handler != nil {
 			state, err = q.handler(state, *event)
 		}
-
 		if handler, ok := q.handlers[event.Name()]; ok {
 			state, err = handler(state, *event)
+		}
+		if err != nil {
+			return state, err
 		}
 
 		if q.isStopped {
