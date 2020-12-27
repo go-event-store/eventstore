@@ -63,3 +63,10 @@ type ProjectorStateNotInitialised struct{}
 func (e ProjectorStateNotInitialised) Error() string {
 	return "Projection state not initialised"
 }
+
+// ProjectorHasNoInitCallback returns if you don't define a Init Callback to initialise the ProjectionState
+type ProjectorHasNoInitCallback struct{}
+
+func (e ProjectorHasNoInitCallback) Error() string {
+	return "Projector has no init callback"
+}

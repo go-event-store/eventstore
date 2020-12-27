@@ -310,10 +310,6 @@ func Test_Projector(t *testing.T) {
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
 		})
 
-		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(uuid.NewV4(), BarEvent{"Bar"}, map[string]interface{}{}, time.Now()),
-		})
-
 		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
 		})
@@ -328,22 +324,163 @@ func Test_Projector(t *testing.T) {
 				switch e := event.Payload().(type) {
 				case FooEvent:
 					state = append(state.([]string), e.Foo)
-				case BarEvent:
-					projector.Reset(ctx)
 				}
 
 				return state, nil
 			}).
 			Run(ctx, false)
 
-		state := projector.State().([]string)
-
-		if len(state) != 1 {
-			t.Error("Projector should return a list of all Events before stop")
+		err := projector.Reset(ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		if state[0] != "Foo1" {
-			t.Error("Projector should values in historical order")
+		state := projector.State().([]string)
+
+		if len(state) != 0 {
+			t.Error("Projector should return an empty list after reset")
+		}
+	})
+
+	t.Run("Process second Run", func(t *testing.T) {
+		ctx := context.Background()
+		aggregateID := uuid.NewV4()
+
+		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
+		es.Install(ctx)
+		es.CreateStream(ctx, "foo-stream")
+		es.CreateStream(ctx, "bar-stream")
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
+		})
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+		})
+
+		projector := eventstore.NewProjector("test", es, memory.NewProjectionManager())
+		projector.
+			Init(func() interface{} {
+				return []string{}
+			}).
+			FromStreams(
+				eventstore.StreamProjection{StreamName: "foo-stream"},
+				eventstore.StreamProjection{StreamName: "bar-stream"},
+			).
+			When(map[string]eventstore.EventHandler{
+				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
+				},
+				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
+				},
+			}).
+			Run(ctx, false)
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo3"}, map[string]interface{}{}, time.Now()).WithVersion(3),
+		})
+		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar1"}, map[string]interface{}{}, time.Now()).WithVersion(1),
+		})
+		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+		})
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
+		})
+
+		err := projector.Run(ctx, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		state := projector.State().([]string)
+
+		if len(state) != 6 {
+			t.Error("Projector should return complete list after second run")
+		}
+	})
+
+	t.Run("Process second Run with new Projector", func(t *testing.T) {
+		ctx := context.Background()
+		aggregateID := uuid.NewV4()
+
+		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
+		es.Install(ctx)
+		es.CreateStream(ctx, "foo-stream")
+		es.CreateStream(ctx, "bar-stream")
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
+		})
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+		})
+
+		pm := memory.NewProjectionManager()
+
+		projector := eventstore.NewProjector("test", es, pm)
+		projector.
+			Init(func() interface{} {
+				return []string{}
+			}).
+			FromStreams(
+				eventstore.StreamProjection{StreamName: "foo-stream"},
+				eventstore.StreamProjection{StreamName: "bar-stream"},
+			).
+			When(map[string]eventstore.EventHandler{
+				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
+				},
+				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
+				},
+			}).
+			Run(ctx, false)
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo3"}, map[string]interface{}{}, time.Now()).WithVersion(3),
+		})
+		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar1"}, map[string]interface{}{}, time.Now()).WithVersion(1),
+		})
+		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+		})
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
+		})
+
+		projector2 := eventstore.NewProjector("test", es, pm)
+		err := projector2.
+			Init(func() interface{} {
+				return []string{}
+			}).
+			FromStreams(
+				eventstore.StreamProjection{StreamName: "foo-stream"},
+				eventstore.StreamProjection{StreamName: "bar-stream"},
+			).
+			When(map[string]eventstore.EventHandler{
+				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
+				},
+				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
+				},
+			}).
+			Run(ctx, false)
+
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		state := projector2.State().([]string)
+
+		if len(state) != 6 {
+			t.Error("Projector should return complete list after second run")
 		}
 	})
 }
