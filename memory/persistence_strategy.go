@@ -80,7 +80,7 @@ func (ps *PersistenceStrategy) AppendTo(ctx context.Context, streamName string, 
 
 	for _, event := range events {
 		nextNumber++
-		ps.streams[streamName] = append(ps.streams[streamName], event.WithNumber(nextNumber))
+		ps.streams[streamName] = append(ps.streams[streamName], event.WithNumber(nextNumber).WithAddedMetadata("stream", streamName))
 	}
 
 	return nil
