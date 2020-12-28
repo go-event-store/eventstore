@@ -2,21 +2,24 @@ package eventstore
 
 import (
 	"context"
+	"errors"
+	"sync"
 )
 
 // Query custom informations from your EventStream
 // Queries are not persisted, they provide the latest state after running
 type Query struct {
 	state            interface{}
-	Status           Status
+	status           Status
 	eventStore       *EventStore
 	initHandler      func() interface{}
 	handler          EventHandler
 	handlers         map[string]EventHandler
 	metadataMatchers map[string]MetadataMatcher
 	streamPositions  map[string]int
-	isStopped        bool
+	running          bool
 	err              error
+	wg               *sync.WaitGroup
 
 	query struct {
 		all     bool
@@ -98,20 +101,24 @@ func (q *Query) WhenAny(handler EventHandler) *Query {
 }
 
 // Reset the query state and EventStream positions
-func (q *Query) Reset() {
+func (q *Query) Reset() error {
+	if q.running {
+		return errors.New("Could not be resetted while running")
+	}
+	if q.initHandler == nil {
+		return ProjectorHasNoInitCallback{}
+	}
+
 	q.streamPositions = map[string]int{}
-	q.state = struct{}{}
+	q.state = q.initHandler()
 	q.err = nil
 
-	if q.initHandler != nil {
-		q.state = q.initHandler()
-	}
+	return nil
 }
 
 // Stop the query
 func (q *Query) Stop() {
-	q.Status = StatusIdle
-	q.isStopped = true
+	q.status = StatusStopping
 }
 
 // Run the Query
@@ -128,20 +135,75 @@ func (q *Query) Run(ctx context.Context) error {
 		return ProjectorStateNotInitialised{}
 	}
 
-	q.isStopped = false
-	q.Status = StatusRunning
-
 	err := q.prepareStreamPosition(ctx)
 	if err != nil {
 		return err
 	}
 
-	events, err := q.retreiveEventsFromStream(ctx)
-	if err != nil {
+	errorChan := make(chan error)
+
+	q.running = false
+	q.status = StatusRunning
+
+	defer func() {
+		q.running = false
+		q.status = StatusIdle
+		close(errorChan)
+	}()
+
+	q.wg.Add(1)
+
+	go q.processEvents(ctx, errorChan)
+
+	select {
+	case err := <-errorChan:
+		q.wg.Wait()
 		return err
 	}
+}
 
-	q.state, err = q.handleEvents(q.state, events)
+func (q *Query) processEvents(ctx context.Context, errorChan chan<- error) {
+	defer q.wg.Done()
+
+	events, err := q.retreiveEventsFromStream(ctx)
+	if err != nil {
+		errorChan <- err
+		return
+	}
+	for events.Next() {
+		event, err := events.Current()
+		if err != nil {
+			errorChan <- err
+			return
+		}
+
+		err = q.handleStream(*event)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+
+		if q.status == StatusStopping {
+			errorChan <- nil
+			return
+		}
+	}
+
+	errorChan <- nil
+}
+
+func (q *Query) handleStream(event DomainEvent) error {
+	var err error
+
+	q.streamPositions[event.Metadata()["stream"].(string)] = event.Number()
+
+	if q.handler != nil {
+		q.state, err = q.handler(q.state, event)
+	}
+
+	if handler, ok := q.handlers[event.Name()]; ok {
+		q.state, err = handler(q.state, event)
+	}
 
 	return err
 }
@@ -149,6 +211,11 @@ func (q *Query) Run(ctx context.Context) error {
 // State returns the current query State
 func (q Query) State() interface{} {
 	return q.state
+}
+
+// Status returns the current query Status
+func (q Query) Status() interface{} {
+	return q.status
 }
 
 func (q *Query) prepareStreamPosition(ctx context.Context) error {
@@ -183,43 +250,18 @@ func (q *Query) retreiveEventsFromStream(ctx context.Context) (DomainEventIterat
 	return q.eventStore.MergeAndLoad(ctx, 0, streams...)
 }
 
-func (q *Query) handleEvents(state interface{}, events DomainEventIterator) (interface{}, error) {
-	var err error
-	for events.Next() {
-		event, err := events.Current()
-		if err != nil {
-			return state, err
-		}
-
-		if q.handler != nil {
-			state, err = q.handler(state, *event)
-		}
-		if handler, ok := q.handlers[event.Name()]; ok {
-			state, err = handler(state, *event)
-		}
-		if err != nil {
-			return state, err
-		}
-
-		if q.isStopped {
-			return state, err
-		}
-	}
-
-	return state, err
-}
-
 // NewQuery for the given EventStore
 func NewQuery(eventStore *EventStore) Query {
 	return Query{
 		state:            nil,
-		Status:           StatusIdle,
+		status:           StatusIdle,
 		eventStore:       eventStore,
 		initHandler:      nil,
 		handler:          nil,
 		handlers:         map[string]EventHandler{},
 		metadataMatchers: map[string]MetadataMatcher{},
 		streamPositions:  map[string]int{},
-		isStopped:        false,
+		running:          false,
+		wg:               new(sync.WaitGroup),
 	}
 }

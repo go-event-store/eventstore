@@ -12,7 +12,41 @@ import (
 	uuid "github.com/satori/go.uuid"
 )
 
-func Test_Projector(t *testing.T) {
+type ReadModel struct {
+	state map[string]string
+}
+
+func (r *ReadModel) Init(ctx context.Context) error {
+	r.state = make(map[string]string)
+
+	return nil
+}
+
+func (r *ReadModel) IsInitialized(ctx context.Context) (bool, error) {
+	return r.state != nil, nil
+}
+
+func (r *ReadModel) Reset(ctx context.Context) error {
+	r.state = make(map[string]string)
+
+	return nil
+}
+
+func (r *ReadModel) Delete(ctx context.Context) error {
+	r.state = make(map[string]string)
+
+	return nil
+}
+
+func (r *ReadModel) Stack(method string, args ...map[string]interface{}) {
+	r.state[args[0]["id"].(string)] = args[0]["name"].(string)
+}
+
+func (r *ReadModel) Persist(ctx context.Context) error {
+	return nil
+}
+
+func Test_ReadModelProjector(t *testing.T) {
 	type FooEvent struct {
 		Foo string
 	}
@@ -21,7 +55,7 @@ func Test_Projector(t *testing.T) {
 		Bar string
 	}
 
-	beforeEach := func(ctx context.Context, aggregateID uuid.UUID) (eventstore.Projector, *eventstore.EventStore, eventstore.ProjectionManager) {
+	beforeEach := func(ctx context.Context, aggregateID uuid.UUID) (eventstore.ReadModelProjector, *eventstore.EventStore, eventstore.ProjectionManager, *ReadModel) {
 		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
 		es.Install(ctx)
 		es.CreateStream(ctx, "foo-stream")
@@ -35,29 +69,39 @@ func Test_Projector(t *testing.T) {
 		})
 
 		pm := memory.NewProjectionManager()
+		rm := &ReadModel{}
 
-		projector := eventstore.NewProjector("test", es, pm)
+		projector := eventstore.NewReadModelProjector("test", rm, es, pm)
 		projector.
 			Init(func() interface{} {
 				return []string{}
 			}).
 			When(map[string]eventstore.EventHandler{
 				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(FooEvent).Foo,
+					})
+
 					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
 				},
 				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(BarEvent).Bar,
+					})
 					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
 				},
 			})
 
-		return projector, es, pm
+		return projector, es, pm, rm
 	}
 
 	t.Run("Project all Events", func(t *testing.T) {
 		ctx := context.Background()
 		aggregateID := uuid.NewV4()
 
-		projector, _, pm := beforeEach(ctx, aggregateID)
+		projector, _, pm, rm := beforeEach(ctx, aggregateID)
 
 		projector.
 			FromStream("foo-stream", nil).
@@ -69,13 +113,22 @@ func Test_Projector(t *testing.T) {
 		}
 
 		state := result.([]string)
-
 		if len(state) != 5 {
 			t.Fatal("Projection should return a list of all Event Payloads")
 		}
 
 		if state[0] != "Foo1" || state[1] != "Foo2" || state[2] != "Foo3" || state[3] != "Bar" || state[4] != "Foo4" {
 			t.Error("Projection should return in historical order")
+		}
+
+		model := rm.state
+		if len(model) != 2 {
+			t.Fatal("ReadModel should return a list of all Aggregates")
+		}
+
+		aggregate := rm.state[aggregateID.String()]
+		if aggregate != "Foo4" {
+			t.Fatal("Unexpected aggregate name")
 		}
 	})
 
@@ -92,19 +145,28 @@ func Test_Projector(t *testing.T) {
 			},
 		}
 
-		projector, _, _ := beforeEach(ctx, aggregateID)
+		projector, _, _, rm := beforeEach(ctx, aggregateID)
 		projector.
 			FromStream("foo-stream", matcher).
 			Run(ctx, false)
 
 		state := projector.State().([]string)
-
 		if len(state) != 4 {
 			t.Error("Projector should return a list of all Event of the given AggregateID")
 		}
 
 		if state[0] != "Foo1" || state[1] != "Foo2" || state[2] != "Foo3" || state[3] != "Foo4" {
 			t.Error("Projector should values in historical order")
+		}
+
+		model := rm.state
+		if len(model) != 1 {
+			t.Fatal("ReadModel should return a single filtered aggregate")
+		}
+
+		aggregate := rm.state[aggregateID.String()]
+		if aggregate != "Foo4" {
+			t.Fatal("Unexpected aggregate name")
 		}
 	})
 
@@ -122,12 +184,12 @@ func Test_Projector(t *testing.T) {
 			{
 				Field:     "_aggregate_version",
 				FieldType: eventstore.MetadataField,
-				Operation: eventstore.GreaterThanOperator,
+				Operation: eventstore.LowerThanEuqalsOperator,
 				Value:     2,
 			},
 		}
 
-		projector, _, _ := beforeEach(ctx, aggregateID)
+		projector, _, _, rm := beforeEach(ctx, aggregateID)
 		projector.
 			FromStream("foo-stream", matcher).
 			Run(ctx, false)
@@ -138,8 +200,13 @@ func Test_Projector(t *testing.T) {
 			t.Error("Projector should return events of type FooEvent and a Version greather than two")
 		}
 
-		if state[0] != "Foo3" || state[1] != "Foo4" {
+		if state[0] != "Foo1" || state[1] != "Foo2" {
 			t.Error("Projector should values in historical order")
+		}
+
+		aggregate := rm.state[aggregateID.String()]
+		if aggregate != "Foo2" {
+			t.Fatal("Unexpected aggregate name")
 		}
 	})
 
@@ -147,8 +214,7 @@ func Test_Projector(t *testing.T) {
 		ctx := context.Background()
 		aggregateID := uuid.NewV4()
 
-		projector, _, _ := beforeEach(ctx, aggregateID)
-
+		projector, _, _, rm := beforeEach(ctx, aggregateID)
 		projector.
 			FromStream("foo-stream", nil).
 			Run(ctx, false)
@@ -159,6 +225,11 @@ func Test_Projector(t *testing.T) {
 
 		if len(state) != 0 {
 			t.Error("State should be resetted")
+		}
+
+		model := rm.state
+		if len(model) != 0 {
+			t.Fatal("ReadModel should be resettet")
 		}
 	})
 
@@ -185,7 +256,8 @@ func Test_Projector(t *testing.T) {
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
 		})
 
-		projector := eventstore.NewProjector("test", es, memory.NewProjectionManager())
+		rm := &ReadModel{}
+		projector := eventstore.NewReadModelProjector("test", rm, es, memory.NewProjectionManager())
 		projector.
 			Init(func() interface{} {
 				return []string{}
@@ -193,9 +265,19 @@ func Test_Projector(t *testing.T) {
 			FromAll().
 			When(map[string]eventstore.EventHandler{
 				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(FooEvent).Foo,
+					})
+
 					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
 				},
 				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(BarEvent).Bar,
+					})
+
 					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
 				},
 			}).
@@ -209,6 +291,11 @@ func Test_Projector(t *testing.T) {
 
 		if state[0] != "Foo1" || state[1] != "Foo2" || state[2] != "Foo3" || state[3] != "Bar" || state[4] != "Foo4" {
 			t.Error("Projector should values in historical order")
+		}
+
+		model := rm.state
+		if len(model) != 2 {
+			t.Fatal("ReadModel should return a list of all Aggregates")
 		}
 	})
 
@@ -235,7 +322,8 @@ func Test_Projector(t *testing.T) {
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
 		})
 
-		projector := eventstore.NewProjector("test", es, memory.NewProjectionManager())
+		rm := &ReadModel{}
+		projector := eventstore.NewReadModelProjector("test", rm, es, memory.NewProjectionManager())
 		projector.
 			Init(func() interface{} {
 				return []string{}
@@ -244,6 +332,11 @@ func Test_Projector(t *testing.T) {
 			WhenAny(func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
 				switch e := event.Payload().(type) {
 				case FooEvent:
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": e.Foo,
+					})
+
 					state = append(state.([]string), e.Foo)
 				case BarEvent:
 					projector.Stop(ctx)
@@ -262,13 +355,18 @@ func Test_Projector(t *testing.T) {
 		if state[0] != "Foo1" || state[1] != "Foo2" || state[2] != "Foo3" {
 			t.Error("Projector should values in historical order")
 		}
+
+		aggregate := rm.state[aggregateID.String()]
+		if aggregate != "Foo3" {
+			t.Fatal("Unexpected aggregate name")
+		}
 	})
 
 	t.Run("Project all Events async", func(t *testing.T) {
 		ctx := context.Background()
 		aggregateID := uuid.NewV4()
 
-		projector, _, _ := beforeEach(ctx, aggregateID)
+		projector, _, _, rm := beforeEach(ctx, aggregateID)
 
 		wg := sync.WaitGroup{}
 		wg.Add(1)
@@ -288,6 +386,16 @@ func Test_Projector(t *testing.T) {
 				t.Error("Projection should return in historical order")
 			}
 
+			model := rm.state
+			if len(model) != 2 {
+				t.Error("ReadModel should return a list of all Aggregates")
+			}
+
+			aggregate := rm.state[aggregateID.String()]
+			if aggregate != "Foo4" {
+				t.Error("Unexpected aggregate name")
+			}
+
 			wg.Done()
 		}()
 
@@ -296,51 +404,6 @@ func Test_Projector(t *testing.T) {
 		projector.Stop(ctx)
 
 		wg.Wait()
-	})
-
-	t.Run("State is empty after reset", func(t *testing.T) {
-		ctx := context.Background()
-		aggregateID := uuid.NewV4()
-
-		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
-		es.Install(ctx)
-		es.CreateStream(ctx, "foo-stream")
-		es.CreateStream(ctx, "bar-stream")
-
-		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
-		})
-
-		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
-		})
-
-		projector := eventstore.NewProjector("test", es, memory.NewProjectionManager())
-		projector.
-			Init(func() interface{} {
-				return []string{}
-			}).
-			FromStreams(eventstore.StreamProjection{StreamName: "foo-stream"}, eventstore.StreamProjection{StreamName: "bar-stream"}).
-			WhenAny(func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
-				switch e := event.Payload().(type) {
-				case FooEvent:
-					state = append(state.([]string), e.Foo)
-				}
-
-				return state, nil
-			}).
-			Run(ctx, false)
-
-		err := projector.Reset(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		state := projector.State().([]string)
-
-		if len(state) != 0 {
-			t.Error("Projector should return an empty list after reset")
-		}
 	})
 
 	t.Run("Process second Run", func(t *testing.T) {
@@ -360,7 +423,8 @@ func Test_Projector(t *testing.T) {
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
 		})
 
-		projector := eventstore.NewProjector("test", es, memory.NewProjectionManager())
+		rm := &ReadModel{}
+		projector := eventstore.NewReadModelProjector("test", rm, es, memory.NewProjectionManager())
 		projector.
 			Init(func() interface{} {
 				return []string{}
@@ -371,9 +435,19 @@ func Test_Projector(t *testing.T) {
 			).
 			When(map[string]eventstore.EventHandler{
 				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(FooEvent).Foo,
+					})
+
 					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
 				},
 				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(BarEvent).Bar,
+					})
+
 					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
 				},
 			}).
@@ -383,10 +457,7 @@ func Test_Projector(t *testing.T) {
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo3"}, map[string]interface{}{}, time.Now()).WithVersion(3),
 		})
 		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar1"}, map[string]interface{}{}, time.Now()).WithVersion(1),
-		})
-		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+			eventstore.NewDomainEvent(uuid.NewV4(), BarEvent{"Bar1"}, map[string]interface{}{}, time.Now()).WithVersion(1),
 		})
 		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
@@ -398,15 +469,25 @@ func Test_Projector(t *testing.T) {
 		}
 
 		state := projector.State().([]string)
-
-		if len(state) != 6 {
+		if len(state) != 5 {
 			t.Error("Projector should return complete list after second run")
+		}
+
+		model := rm.state
+		if len(model) != 2 {
+			t.Error("ReadModel should return a list of all Aggregates")
+		}
+
+		aggregate := rm.state[aggregateID.String()]
+		if aggregate != "Foo4" {
+			t.Error("Unexpected aggregate name")
 		}
 	})
 
 	t.Run("Process second Run with new Projector", func(t *testing.T) {
 		ctx := context.Background()
-		aggregateID := uuid.NewV4()
+		fooID := uuid.NewV4()
+		barID := uuid.NewV4()
 
 		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
 		es.Install(ctx)
@@ -414,16 +495,16 @@ func Test_Projector(t *testing.T) {
 		es.CreateStream(ctx, "bar-stream")
 
 		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
+			eventstore.NewDomainEvent(fooID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
 		})
 
 		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+			eventstore.NewDomainEvent(fooID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
 		})
 
+		rm := &ReadModel{}
 		pm := memory.NewProjectionManager()
-
-		projector := eventstore.NewProjector("test", es, pm)
+		projector := eventstore.NewReadModelProjector("test", rm, es, pm)
 		projector.
 			Init(func() interface{} {
 				return []string{}
@@ -434,28 +515,38 @@ func Test_Projector(t *testing.T) {
 			).
 			When(map[string]eventstore.EventHandler{
 				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(FooEvent).Foo,
+					})
+
 					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
 				},
 				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(BarEvent).Bar,
+					})
+
 					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
 				},
 			}).
 			Run(ctx, false)
 
 		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo3"}, map[string]interface{}{}, time.Now()).WithVersion(3),
+			eventstore.NewDomainEvent(fooID, FooEvent{"Foo3"}, map[string]interface{}{}, time.Now()).WithVersion(3),
 		})
 		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar1"}, map[string]interface{}{}, time.Now()).WithVersion(1),
+			eventstore.NewDomainEvent(barID, BarEvent{"Bar1"}, map[string]interface{}{}, time.Now()).WithVersion(1),
 		})
 		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+			eventstore.NewDomainEvent(barID, BarEvent{"Bar2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
 		})
 		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
-			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
+			eventstore.NewDomainEvent(fooID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
 		})
 
-		projector2 := eventstore.NewProjector("test", es, pm)
+		projector2 := eventstore.NewReadModelProjector("test", rm, es, pm)
 		err := projector2.
 			Init(func() interface{} {
 				return []string{}
@@ -466,9 +557,19 @@ func Test_Projector(t *testing.T) {
 			).
 			When(map[string]eventstore.EventHandler{
 				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(FooEvent).Foo,
+					})
+
 					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
 				},
 				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					projector.ReadModel.Stack("add", map[string]interface{}{
+						"id":   event.AggregateID().String(),
+						"name": event.Payload().(BarEvent).Bar,
+					})
+
 					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
 				},
 			}).
@@ -482,6 +583,21 @@ func Test_Projector(t *testing.T) {
 
 		if len(state) != 6 {
 			t.Error("Projector should return complete list after second run")
+		}
+
+		model := rm.state
+		if len(model) != 2 {
+			t.Error("ReadModel should return a list of all Aggregates")
+		}
+
+		foo := rm.state[fooID.String()]
+		if foo != "Foo4" {
+			t.Error("Unexpected aggregate name")
+		}
+
+		bar := rm.state[barID.String()]
+		if bar != "Bar2" {
+			t.Error("Unexpected aggregate name")
 		}
 	})
 
@@ -497,7 +613,8 @@ func Test_Projector(t *testing.T) {
 			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
 		})
 
-		projector := eventstore.NewProjector("test", es, memory.NewProjectionManager())
+		rm := &ReadModel{}
+		projector := eventstore.NewReadModelProjector("test", rm, es, memory.NewProjectionManager())
 		err := projector.
 			Init(func() interface{} {
 				return []string{}

@@ -2,6 +2,7 @@ package eventstore_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -252,6 +253,146 @@ func Test_Queries(t *testing.T) {
 
 		if state[0] != "Foo1" || state[1] != "Foo2" || state[2] != "Foo3" {
 			t.Error("Query should values in historical order")
+		}
+	})
+
+	t.Run("State is empty after reset", func(t *testing.T) {
+		ctx := context.Background()
+		aggregateID := uuid.NewV4()
+
+		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
+		es.Install(ctx)
+		es.CreateStream(ctx, "foo-stream")
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
+		})
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+		})
+
+		query := eventstore.NewQuery(es)
+		query.
+			Init(func() interface{} {
+				return []string{}
+			}).
+			FromStreams(eventstore.StreamProjection{StreamName: "foo-stream"}, eventstore.StreamProjection{StreamName: "bar-stream"}).
+			WhenAny(func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+				switch e := event.Payload().(type) {
+				case FooEvent:
+					state = append(state.([]string), e.Foo)
+				}
+
+				return state, nil
+			}).
+			Run(ctx)
+
+		err := query.Reset()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		state := query.State().([]string)
+
+		if len(state) != 0 {
+			t.Error("Projector should return an empty list after reset")
+		}
+	})
+
+	t.Run("Process second Run", func(t *testing.T) {
+		ctx := context.Background()
+		aggregateID := uuid.NewV4()
+
+		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
+		es.Install(ctx)
+		es.CreateStream(ctx, "foo-stream")
+		es.CreateStream(ctx, "bar-stream")
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
+		})
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+		})
+
+		query := eventstore.NewQuery(es)
+		query.
+			Init(func() interface{} {
+				return []string{}
+			}).
+			FromStreams(
+				eventstore.StreamProjection{StreamName: "foo-stream"},
+				eventstore.StreamProjection{StreamName: "bar-stream"},
+			).
+			When(map[string]eventstore.EventHandler{
+				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
+				},
+				"BarEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(BarEvent).Bar), nil
+				},
+			}).
+			Run(ctx)
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo3"}, map[string]interface{}{}, time.Now()).WithVersion(3),
+		})
+		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar1"}, map[string]interface{}{}, time.Now()).WithVersion(1),
+		})
+		es.AppendTo(ctx, "bar-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, BarEvent{"Bar2"}, map[string]interface{}{}, time.Now()).WithVersion(2),
+		})
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo4"}, map[string]interface{}{}, time.Now()).WithVersion(4),
+		})
+
+		err := query.Run(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		state := query.State().([]string)
+
+		if len(state) != 6 {
+			t.Error("Projector should return complete list after second run")
+		}
+	})
+
+	t.Run("Query return error returned by handler", func(t *testing.T) {
+		ctx := context.Background()
+		aggregateID := uuid.NewV4()
+
+		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
+		es.Install(ctx)
+		es.CreateStream(ctx, "foo-stream")
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, map[string]interface{}{}, time.Now()),
+		})
+
+		query := eventstore.NewQuery(es)
+		err := query.
+			Init(func() interface{} {
+				return []string{}
+			}).
+			FromStreams(
+				eventstore.StreamProjection{StreamName: "foo-stream"},
+				eventstore.StreamProjection{StreamName: "bar-stream"},
+			).
+			WhenAny(func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+				return state, errors.New("handler error")
+			}).
+			Run(ctx)
+
+		if err == nil {
+			t.Fatal("Should return handler error")
+		}
+
+		if err.Error() != "handler error" {
+			t.Error("unexpected error")
 		}
 	})
 }

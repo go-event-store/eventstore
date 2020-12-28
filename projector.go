@@ -24,7 +24,7 @@ type Projector struct {
 	running          bool
 	err              error
 	wg               *sync.WaitGroup
-	stopChan         chan Status
+	stopChan         chan bool
 
 	query struct {
 		all     bool
@@ -158,24 +158,20 @@ func (q *Projector) Reset(ctx context.Context) error {
 
 	q.streamPositions = map[string]int{}
 	q.state = q.initHandler()
+	q.err = nil
 
 	return q.manager.ResetProjection(ctx, q.name, q.state)
 }
 
 // Stop the Projection and persist the current state and EventStream positions
 func (q *Projector) Stop(ctx context.Context) error {
-	err := q.manager.UpdateProjectionStatus(ctx, q.name, StatusIdle)
-	if err != nil {
-		return err
-	}
-
 	q.status = StatusStopping
 
 	if q.running {
-		q.stopChan <- StatusStopping
+		q.stopChan <- true
 	}
 
-	return nil
+	return q.manager.UpdateProjectionStatus(ctx, q.name, StatusIdle)
 }
 
 // Run the Projection
@@ -216,15 +212,20 @@ func (q *Projector) Run(ctx context.Context, keepRunning bool) error {
 	}
 
 	breakChan := make(chan bool, 1)
+	persistChan := make(chan bool)
 	errorChan := make(chan error)
-	persistChan := make(chan int)
 
 	q.running = true
+	q.status = StatusRunning
 
 	defer func() {
 		q.running = false
+		q.status = StatusIdle
 		close(breakChan)
 		close(errorChan)
+		close(q.stopChan)
+
+		q.stopChan = make(chan bool, 1)
 	}()
 
 	q.wg.Add(2)
@@ -232,18 +233,11 @@ func (q *Projector) Run(ctx context.Context, keepRunning bool) error {
 	go q.processEvents(ctx, breakChan, persistChan, errorChan, keepRunning)
 	go q.persist(ctx, persistChan, errorChan)
 
-	if !keepRunning {
-		q.wg.Wait()
-		return nil
-	}
-
 	select {
 	case err := <-errorChan:
 		q.wg.Wait()
 		return err
-	case status := <-q.stopChan:
-		q.status = status
-
+	case <-q.stopChan:
 		breakChan <- true
 		q.wg.Wait()
 		return q.err
@@ -252,13 +246,13 @@ func (q *Projector) Run(ctx context.Context, keepRunning bool) error {
 
 func (q *Projector) processEvents(
 	ctx context.Context,
-	stopChan <-chan bool,
-	persistChan chan<- int,
+	breakChan <-chan bool,
+	persistChan chan<- bool,
 	errorChan chan<- error,
 	keepRunning bool,
 ) {
 	defer func() {
-		persistChan <- 1
+		persistChan <- true
 		close(persistChan)
 		q.wg.Done()
 	}()
@@ -292,24 +286,25 @@ func (q *Projector) processEvents(
 			counter++
 
 			if counter == q.persistBlockSize {
-				persistChan <- 1
+				persistChan <- true
 				counter = 0
 			}
 		}
 
 		if !keepRunning {
+			q.stopChan <- true
 			return
 		}
 
 		select {
 		case <-ticker.C:
-		case <-stopChan:
+		case <-breakChan:
 			return
 		}
 	}
 }
 
-func (q *Projector) persist(ctx context.Context, persistChan <-chan int, errorChan chan<- error) {
+func (q *Projector) persist(ctx context.Context, persistChan <-chan bool, errorChan chan<- error) {
 	defer q.wg.Done()
 
 	for range persistChan {
@@ -426,7 +421,6 @@ func NewProjector(name string, eventStore *EventStore, manager ProjectionManager
 		streamCreated:    false,
 		persistBlockSize: 1000,
 		wg:               new(sync.WaitGroup),
-
-		stopChan: make(chan Status, 1),
+		stopChan:         make(chan bool, 1),
 	}
 }

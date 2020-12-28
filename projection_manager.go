@@ -6,12 +6,9 @@ import "context"
 type Status string
 
 const (
-	StatusIdle                        Status = "idle"
-	StatusRunning                     Status = "running"
-	StatusStopping                    Status = "stopping"
-	StatusResetting                   Status = "resetting"
-	StatusDeleting                    Status = "deleting"
-	StatusDeletingIinclEmittedEevents Status = "deleting incl emitted events"
+	StatusIdle     Status = "idle"
+	StatusRunning  Status = "running"
+	StatusStopping Status = "stopping"
 )
 
 // StreamProjection is used if you want to Projection over different Streams with different Filters

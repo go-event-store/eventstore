@@ -2,6 +2,8 @@ package eventstore
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"time"
 )
 
@@ -20,8 +22,10 @@ type ReadModelProjector struct {
 	streamPositions  map[string]int
 	persistBlockSize int
 	eventCounter     int
-	isStopped        bool
+	running          bool
 	err              error
+	wg               *sync.WaitGroup
+	stopChan         chan bool
 
 	query struct {
 		all     bool
@@ -104,58 +108,54 @@ func (q *ReadModelProjector) WhenAny(handler EventHandler) *ReadModelProjector {
 
 // Delete the ReadModelProjection from the Projections table / collection and if deleteProjection is true
 // it also runs the Delete Method of your ReadModel
-func (q *ReadModelProjector) Delete(ctx context.Context, deleteProjection bool) error {
+func (q *ReadModelProjector) Delete(ctx context.Context) error {
+	if q.running {
+		return errors.New("Could not be deleted while running")
+	}
+
 	err := q.manager.DeleteProjection(ctx, q.name)
 	if err != nil {
 		return err
 	}
 
-	if deleteProjection {
-		err = q.ReadModel.Delete(ctx)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return q.ReadModel.Delete(ctx)
 }
 
 // Reset the ReadModelProjection state and EventStream positions
 // Run also the Reset Method of your ReadModel
 func (q *ReadModelProjector) Reset(ctx context.Context) error {
-	q.streamPositions = map[string]int{}
-	q.state = struct{}{}
-	q.err = nil
-
+	if q.running {
+		return errors.New("Could not be resetted while running")
+	}
+	if q.initHandler == nil {
+		return ProjectorHasNoInitCallback{}
+	}
 	err := q.ReadModel.Reset(ctx)
 	if err != nil {
 		return err
 	}
 
-	if q.initHandler != nil {
-		q.state = q.initHandler()
-	}
+	q.streamPositions = map[string]int{}
+	q.state = q.initHandler()
+	q.err = nil
 
 	return q.manager.ResetProjection(ctx, q.name, q.state)
 }
 
 // Stop the ReadModelProjection and persist the current state and EventStream positions
 func (q *ReadModelProjector) Stop(ctx context.Context) error {
-	err := q.persist(ctx)
+	err := q.persistReadModel(ctx)
 	if err != nil {
 		return err
 	}
 
-	q.status = StatusIdle
+	q.status = StatusStopping
 
-	err = q.manager.UpdateProjectionStatus(ctx, q.name, StatusIdle)
-	if err != nil {
-		return err
+	if q.running {
+		q.stopChan <- true
 	}
 
-	q.isStopped = true
-
-	return nil
+	return q.manager.UpdateProjectionStatus(ctx, q.name, StatusIdle)
 }
 
 // Run the ReadModelProjection
@@ -173,33 +173,6 @@ func (q *ReadModelProjector) Run(ctx context.Context, keepRunning bool) error {
 	}
 
 	var err error
-
-	switch q.fetchRemoteStatus(ctx) {
-	case StatusStopping:
-		err = q.load(ctx)
-		if err != nil {
-			return err
-		}
-
-		err = q.Stop(ctx)
-		if err != nil {
-			return err
-		}
-	case StatusDeleting:
-		err = q.Delete(ctx, true)
-		if err != nil {
-			return err
-		}
-	case StatusResetting:
-		err = q.Reset(ctx)
-		if err != nil {
-			return err
-		}
-
-		if keepRunning {
-			q.startAgain(ctx)
-		}
-	}
 
 	if ok, err := q.manager.ProjectionExists(ctx, q.name); ok == false {
 		if err != nil {
@@ -233,66 +206,109 @@ func (q *ReadModelProjector) Run(ctx context.Context, keepRunning bool) error {
 		return err
 	}
 
-	q.isStopped = false
+	breakChan := make(chan bool, 1)
+	persistChan := make(chan bool)
+	errorChan := make(chan error)
+
+	q.running = true
+	q.status = StatusRunning
+
+	defer func() {
+		q.running = false
+		q.status = StatusIdle
+		close(breakChan)
+		close(errorChan)
+		close(q.stopChan)
+
+		q.stopChan = make(chan bool, 1)
+	}()
+
+	q.wg.Add(2)
+
+	go q.processEvents(ctx, breakChan, persistChan, errorChan, keepRunning)
+	go q.persist(ctx, persistChan, errorChan)
+
+	select {
+	case err := <-errorChan:
+		q.wg.Wait()
+		return err
+	case <-q.stopChan:
+		breakChan <- true
+		q.wg.Wait()
+		return q.err
+	}
+}
+
+func (q *ReadModelProjector) processEvents(
+	ctx context.Context,
+	breakChan <-chan bool,
+	persistChan chan<- bool,
+	errorChan chan<- error,
+	keepRunning bool,
+) {
+	defer func() {
+		persistChan <- true
+		close(persistChan)
+		q.wg.Done()
+	}()
+
+	var counter int
+	ticker := time.NewTicker(200 * time.Millisecond)
 
 	for {
 		events, err := q.retreiveEventsFromStream(ctx)
 		if err != nil {
-			return err
+			errorChan <- err
+			return
 		}
-
-		err = q.handleStream(ctx, events)
-		if err != nil {
-			return err
-		}
-
-		if q.eventCounter > 0 {
-			err := q.persist(ctx)
+		for events.Next() {
+			event, err := events.Current()
 			if err != nil {
-				return err
-			}
-		}
-
-		q.eventCounter = 0
-
-		switch q.fetchRemoteStatus(ctx) {
-		case StatusStopping:
-			err = q.Stop(ctx)
-			if err != nil {
-				return err
-			}
-		case StatusDeleting:
-			err = q.Delete(ctx, false)
-			if err != nil {
-				return err
-			}
-		case StatusDeletingIinclEmittedEevents:
-			err = q.Delete(ctx, true)
-			if err != nil {
-				return err
-			}
-		case StatusResetting:
-			err = q.Reset(ctx)
-			if err != nil {
-				return err
+				errorChan <- err
+				return
 			}
 
-			if keepRunning {
-				err = q.startAgain(ctx)
-				if err != nil {
-					return err
-				}
+			err = q.handleStream(*event)
+			if err != nil {
+				errorChan <- err
+				return
+			}
+
+			if q.status == StatusStopping {
+				return
+			}
+
+			counter++
+
+			if counter == q.persistBlockSize {
+				persistChan <- true
+				counter = 0
 			}
 		}
 
-		if !keepRunning || q.isStopped {
-			break
+		if !keepRunning {
+			q.stopChan <- true
+			return
 		}
 
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-ticker.C:
+		case <-breakChan:
+			return
+		}
 	}
+}
 
-	return nil
+func (q *ReadModelProjector) persist(ctx context.Context, persistChan <-chan bool, errorChan chan<- error) {
+	defer q.wg.Done()
+
+	for range persistChan {
+		err := q.persistReadModel(ctx)
+		if err != nil {
+			errorChan <- err
+			return
+		}
+	}
 }
 
 // State returns the current ReadModelProjection State
@@ -310,19 +326,6 @@ func (q ReadModelProjector) Status() Status {
 	return q.status
 }
 
-func (q *ReadModelProjector) startAgain(ctx context.Context) error {
-	q.isStopped = false
-
-	err := q.manager.UpdateProjectionStatus(ctx, q.name, StatusRunning)
-	if err != nil {
-		return err
-	}
-
-	q.status = StatusRunning
-
-	return nil
-}
-
 func (q *ReadModelProjector) load(ctx context.Context) error {
 	positions, state, err := q.manager.LoadProjection(ctx, q.name)
 	if err != nil {
@@ -338,7 +341,7 @@ func (q *ReadModelProjector) load(ctx context.Context) error {
 	return nil
 }
 
-func (q *ReadModelProjector) persist(ctx context.Context) error {
+func (q *ReadModelProjector) persistReadModel(ctx context.Context) error {
 	err := q.ReadModel.Persist(ctx)
 	if err != nil {
 		return err
@@ -347,26 +350,6 @@ func (q *ReadModelProjector) persist(ctx context.Context) error {
 	err = q.manager.PersistProjection(ctx, q.name, q.state, q.streamPositions)
 	if err != nil {
 		return err
-	}
-
-	return nil
-}
-
-func (q *ReadModelProjector) persistAndFetchRemoteStatusWhenBlockSizeThresholdReached(ctx context.Context) error {
-	if q.eventCounter != q.persistBlockSize {
-		return nil
-	}
-
-	err := q.persist(ctx)
-	if err != nil {
-		return err
-	}
-
-	q.eventCounter = 0
-	q.status = q.fetchRemoteStatus(ctx)
-
-	if _, ok := FindStatusInSlice([]Status{StatusIdle, StatusRunning}, q.status); ok == false {
-		q.isStopped = true
 	}
 
 	return nil
@@ -413,38 +396,20 @@ func (q *ReadModelProjector) retreiveEventsFromStream(ctx context.Context) (Doma
 	return q.eventStore.MergeAndLoad(ctx, 0, streams...)
 }
 
-func (q *ReadModelProjector) handleStream(ctx context.Context, events DomainEventIterator) error {
-	for events.Next() {
-		event, err := events.Current()
-		if err != nil {
-			return err
-		}
+func (q *ReadModelProjector) handleStream(event DomainEvent) error {
+	var err error
 
-		q.streamPositions[event.Metadata()["stream"].(string)] = event.Number()
-		q.eventCounter++
+	q.streamPositions[event.Metadata()["stream"].(string)] = event.Number()
 
-		if q.handler != nil {
-			q.state, err = q.handler(q.state, *event)
-		}
-
-		if handler, ok := q.handlers[event.Name()]; ok {
-			q.state, err = handler(q.state, *event)
-		}
-		if err != nil {
-			return err
-		}
-
-		err = q.persistAndFetchRemoteStatusWhenBlockSizeThresholdReached(ctx)
-		if err != nil {
-			return err
-		}
-
-		if q.isStopped {
-			break
-		}
+	if q.handler != nil {
+		q.state, err = q.handler(q.state, event)
 	}
 
-	return nil
+	if handler, ok := q.handlers[event.Name()]; ok {
+		q.state, err = handler(q.state, event)
+	}
+
+	return err
 }
 
 // NewReadModelProjector for the given ReadModel implementation, EventStore and ProjectionManager
@@ -462,8 +427,10 @@ func NewReadModelProjector(name string, readModel ReadModel, eventStore *EventSt
 		handlers:         map[string]EventHandler{},
 		metadataMatchers: map[string]MetadataMatcher{},
 		streamPositions:  map[string]int{},
-		isStopped:        false,
+		running:          false,
 		eventCounter:     0,
 		persistBlockSize: 1000,
+		wg:               new(sync.WaitGroup),
+		stopChan:         make(chan bool, 1),
 	}
 }
