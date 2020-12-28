@@ -252,7 +252,6 @@ func (q *Projector) processEvents(
 	keepRunning bool,
 ) {
 	defer func() {
-		persistChan <- true
 		close(persistChan)
 		q.wg.Done()
 	}()
@@ -290,6 +289,9 @@ func (q *Projector) processEvents(
 				counter = 0
 			}
 		}
+
+		persistChan <- true
+		counter = 0
 
 		if !keepRunning {
 			q.stopChan <- true

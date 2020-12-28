@@ -286,6 +286,9 @@ func (q *ReadModelProjector) processEvents(
 			}
 		}
 
+		persistChan <- true
+		counter = 0
+
 		if !keepRunning {
 			q.stopChan <- true
 			return
