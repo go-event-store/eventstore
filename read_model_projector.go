@@ -25,6 +25,7 @@ type ReadModelProjector struct {
 	running          bool
 	err              error
 	wg               *sync.WaitGroup
+	mx               *sync.RWMutex
 	stopChan         chan bool
 
 	query struct {
@@ -144,12 +145,9 @@ func (q *ReadModelProjector) Reset(ctx context.Context) error {
 
 // Stop the ReadModelProjection and persist the current state and EventStream positions
 func (q *ReadModelProjector) Stop(ctx context.Context) error {
-	err := q.persistReadModel(ctx)
-	if err != nil {
-		return err
-	}
-
+	q.mx.Lock()
 	q.status = StatusStopping
+	q.mx.Unlock()
 
 	if q.running {
 		q.stopChan <- true
@@ -210,8 +208,10 @@ func (q *ReadModelProjector) Run(ctx context.Context, keepRunning bool) error {
 	persistChan := make(chan bool)
 	errorChan := make(chan error)
 
+	q.mx.Lock()
 	q.running = true
 	q.status = StatusRunning
+	q.mx.Unlock()
 
 	defer func() {
 		q.running = false
@@ -274,9 +274,11 @@ func (q *ReadModelProjector) processEvents(
 				return
 			}
 
+			q.mx.RLock()
 			if q.status == StatusStopping {
 				return
 			}
+			q.mx.RUnlock()
 
 			counter++
 
@@ -326,6 +328,9 @@ func (q ReadModelProjector) Name() string {
 
 // Status returns the current ReadModelProjection Status
 func (q ReadModelProjector) Status() Status {
+	q.mx.RLock()
+	defer q.mx.RUnlock()
+
 	return q.status
 }
 
@@ -434,6 +439,7 @@ func NewReadModelProjector(name string, readModel ReadModel, eventStore *EventSt
 		eventCounter:     0,
 		persistBlockSize: 1000,
 		wg:               new(sync.WaitGroup),
+		mx:               new(sync.RWMutex),
 		stopChan:         make(chan bool, 1),
 	}
 }

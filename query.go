@@ -20,6 +20,7 @@ type Query struct {
 	running          bool
 	err              error
 	wg               *sync.WaitGroup
+	mx               *sync.RWMutex
 
 	query struct {
 		all     bool
@@ -118,7 +119,9 @@ func (q *Query) Reset() error {
 
 // Stop the query
 func (q *Query) Stop() {
+	q.mx.Lock()
 	q.status = StatusStopping
+	q.mx.Unlock()
 }
 
 // Run the Query
@@ -142,8 +145,10 @@ func (q *Query) Run(ctx context.Context) error {
 
 	errorChan := make(chan error)
 
-	q.running = false
+	q.mx.Lock()
+	q.running = true
 	q.status = StatusRunning
+	q.mx.Unlock()
 
 	defer func() {
 		q.running = false
@@ -183,10 +188,12 @@ func (q *Query) processEvents(ctx context.Context, errorChan chan<- error) {
 			return
 		}
 
+		q.mx.RLock()
 		if q.status == StatusStopping {
 			errorChan <- nil
 			return
 		}
+		q.mx.RUnlock()
 	}
 
 	errorChan <- nil
@@ -215,6 +222,9 @@ func (q Query) State() interface{} {
 
 // Status returns the current query Status
 func (q Query) Status() interface{} {
+	q.mx.RLock()
+	defer q.mx.RUnlock()
+
 	return q.status
 }
 
@@ -263,5 +273,6 @@ func NewQuery(eventStore *EventStore) Query {
 		streamPositions:  map[string]int{},
 		running:          false,
 		wg:               new(sync.WaitGroup),
+		mx:               new(sync.RWMutex),
 	}
 }

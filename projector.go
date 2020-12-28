@@ -24,6 +24,7 @@ type Projector struct {
 	running          bool
 	err              error
 	wg               *sync.WaitGroup
+	mx               *sync.RWMutex
 	stopChan         chan bool
 
 	query struct {
@@ -165,7 +166,9 @@ func (q *Projector) Reset(ctx context.Context) error {
 
 // Stop the Projection and persist the current state and EventStream positions
 func (q *Projector) Stop(ctx context.Context) error {
+	q.mx.Lock()
 	q.status = StatusStopping
+	q.mx.Unlock()
 
 	if q.running {
 		q.stopChan <- true
@@ -215,8 +218,10 @@ func (q *Projector) Run(ctx context.Context, keepRunning bool) error {
 	persistChan := make(chan bool)
 	errorChan := make(chan error)
 
+	q.mx.Lock()
 	q.running = true
 	q.status = StatusRunning
+	q.mx.Unlock()
 
 	defer func() {
 		q.running = false
@@ -278,9 +283,11 @@ func (q *Projector) processEvents(
 				return
 			}
 
+			q.mx.RLock()
 			if q.status == StatusStopping {
 				return
 			}
+			q.mx.RUnlock()
 
 			counter++
 
@@ -330,6 +337,9 @@ func (q *Projector) Name() string {
 
 // Status of the Projection
 func (q *Projector) Status() Status {
+	q.mx.RLock()
+	defer q.mx.RUnlock()
+
 	return q.status
 }
 
@@ -423,6 +433,7 @@ func NewProjector(name string, eventStore *EventStore, manager ProjectionManager
 		streamCreated:    false,
 		persistBlockSize: 1000,
 		wg:               new(sync.WaitGroup),
+		mx:               new(sync.RWMutex),
 		stopChan:         make(chan bool, 1),
 	}
 }
