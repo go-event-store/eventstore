@@ -283,11 +283,10 @@ func (q *Projector) processEvents(
 				return
 			}
 
-			q.mx.RLock()
-			if q.status == StatusStopping {
+			if q.Status() == StatusStopping {
+				persistChan <- true
 				return
 			}
-			q.mx.RUnlock()
 
 			counter++
 
