@@ -107,12 +107,12 @@ func (e DomainEvent) WithAggregateType(aType string) DomainEvent {
 // WithAddedMetadata create a copy of the event with the given additional Metadata
 func (e DomainEvent) WithAddedMetadata(name string, value interface{}) DomainEvent {
 	switch value.(type) {
-	case string, int, float64:
+	case string, int, float64, bool:
 		metadata := CopyMap(e.metadata)
 		metadata[name] = value
 		e.metadata = metadata
 	default:
-		panic("only int, string, float are supported as additional metadata for now")
+		panic("only int, string, float64 and bool are supported as additional metadata for now")
 	}
 
 	return e

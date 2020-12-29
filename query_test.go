@@ -204,6 +204,46 @@ func Test_Queries(t *testing.T) {
 		}
 	})
 
+	t.Run("Query with bool MetaMatcher", func(t *testing.T) {
+		ctx := context.Background()
+		aggregateID := uuid.NewV4()
+
+		es := eventstore.NewEventStore(memory.NewPersistenceStrategy())
+		es.Install(ctx)
+		es.CreateStream(ctx, "foo-stream")
+
+		es.AppendTo(ctx, "foo-stream", []eventstore.DomainEvent{
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo1"}, nil, time.Now()).WithAddedMetadata("first", true),
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo2"}, nil, time.Now()).WithVersion(2),
+			eventstore.NewDomainEvent(aggregateID, FooEvent{"Foo3"}, nil, time.Now()).WithVersion(3),
+		})
+
+		query := eventstore.NewQuery(es)
+		query.
+			Init(func() interface{} {
+				return []string{}
+			}).
+			FromStream("foo-stream", []eventstore.MetadataMatch{
+				{Field: "first", FieldType: eventstore.MetadataField, Operation: eventstore.EqualsOperator, Value: true},
+			}).
+			When(map[string]eventstore.EventHandler{
+				"FooEvent": func(state interface{}, event eventstore.DomainEvent) (interface{}, error) {
+					return append(state.([]string), event.Payload().(FooEvent).Foo), nil
+				},
+			}).
+			Run(ctx)
+
+		state := query.State().([]string)
+
+		if len(state) != 1 {
+			t.Error("Query should return first event with required metadata")
+		}
+
+		if state[0] != "Foo1" {
+			t.Error("Query should fetch requested event")
+		}
+	})
+
 	t.Run("Query all Events from multiple streams with one handler until it stops", func(t *testing.T) {
 		ctx := context.Background()
 		aggregateID := uuid.NewV4()
